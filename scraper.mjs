@@ -1,23 +1,13 @@
 #!/usr/bin/env node
 /**
- * STGBLOG X (Twitter) Content Scraper v2.0
+ * STGBLOG X (Twitter) Content Scraper v3.0
  *
- * 方案: 直接调用 X 内部 GraphQL API（使用登录 cookie）
- * - 免费、无需 X API 付费
- * - 只搬运纯文字
- * - 每条注明原作者和原文链接
- * - GitHub Actions 每30分钟自动运行
- *
- * 合法性:
- * - 仅抓取公开可见内容
- * - 标注原作者 + 原文链接
- * - 不搬运多媒体
+ * 使用 X 内部 API + Cookie + Guest Token
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { createClient } from "@supabase/supabase-js";
 
-// ─── Config ───
 const CONFIG = JSON.parse(readFileSync(new URL("./config.json", import.meta.url), "utf-8"));
 const STATE_FILE = new URL("./state.json", import.meta.url);
 
@@ -29,56 +19,79 @@ const TWITTER_COOKIE = process.env.TWITTER_COOKIE || "";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ─── X API Constants ───
-const BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
-const GRAPHQL_BASE = "https://x.com/i/api/graphql";
+const BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 
 // ─── State ───
 function loadState() {
-  if (existsSync(STATE_FILE)) {
-    return JSON.parse(readFileSync(STATE_FILE, "utf-8"));
-  }
+  if (existsSync(STATE_FILE)) return JSON.parse(readFileSync(STATE_FILE, "utf-8"));
   return { accounts: {} };
 }
-
 function saveState(state) {
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// ─── X API Client ───
-function parseCookies(cookieStr) {
-  const cookies = {};
-  for (const part of cookieStr.split(";")) {
-    const [key, ...vals] = part.trim().split("=");
-    if (key && vals.length) cookies[key.trim()] = vals.join("=").trim();
+// ─── Cookie parsing ───
+function parseCookies(str) {
+  const c = {};
+  for (const p of str.split(";")) {
+    const [k, ...v] = p.trim().split("=");
+    if (k && v.length) c[k.trim()] = v.join("=").trim();
   }
-  return cookies;
+  return c;
 }
 
-function buildHeaders(cookieStr) {
+// ─── Get Guest Token (fallback) ───
+async function getGuestToken() {
+  try {
+    const res = await fetch("https://api.twitter.com/1.1/guest/activate.json", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${BEARER_TOKEN}`,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.guest_token;
+    }
+  } catch (e) {
+    console.log(`  ⚠️ Guest token failed: ${e.message}`);
+  }
+  return null;
+}
+
+// ─── Build request headers ───
+function buildHeaders(cookieStr, guestToken) {
   const cookies = parseCookies(cookieStr);
-  return {
+  const h = {
     Authorization: `Bearer ${BEARER_TOKEN}`,
-    Cookie: cookieStr,
-    "x-csrf-token": cookies.ct0 || "",
-    "x-twitter-auth-type": "OAuth2Session",
-    "x-twitter-active-user": "yes",
-    "x-twitter-client-language": "en",
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     Accept: "*/*",
     "Accept-Language": "en-US,en;q=0.9",
     Referer: "https://x.com/",
     "Content-Type": "application/json",
   };
+
+  if (cookieStr) {
+    h.Cookie = cookieStr;
+    if (cookies.ct0) h["x-csrf-token"] = cookies.ct0;
+    h["x-twitter-auth-type"] = "OAuth2Session";
+    h["x-twitter-active-user"] = "yes";
+    h["x-twitter-client-language"] = "en";
+  }
+
+  if (guestToken) {
+    h["x-guest-token"] = guestToken;
+  }
+
+  return h;
 }
 
-// Step 1: Get user ID from screen name
+// ─── Try to get user ID via multiple methods ───
 async function getUserId(screenName, headers) {
-  const variables = JSON.stringify({
-    screen_name: screenName,
-    withSafetyModeUserFields: true,
-  });
+  // Method 1: GraphQL API
+  const variables = JSON.stringify({ screen_name: screenName, withSafetyModeUserFields: true });
   const features = JSON.stringify({
     hidden_profile_subscriptions_enabled: true,
     rweb_tipjar_consumption_enabled: true,
@@ -94,43 +107,65 @@ async function getUserId(screenName, headers) {
     responsive_web_graphql_timeline_navigation_enabled: true,
   });
 
-  const url = `${GRAPHQL_BASE}/UserByScreenName?variables=${encodeURIComponent(variables)}&features=${encodeURIComponent(features)}`;
+  const url = `https://x.com/i/api/graphql/UserByScreenName?variables=${encodeURIComponent(variables)}&features=${encodeURIComponent(features)}`;
 
-  console.log(`  📡 Requesting UserByScreenName for @${screenName}...`);
-  const res = await fetch(url, {
-    headers,
+  console.log(`  📡 GraphQL: UserByScreenName @${screenName}`);
+  let res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+  let body = await res.text();
+  console.log(`  📊 HTTP ${res.status} | Body: ${body.length} bytes`);
+
+  if (body.length > 0) {
+    try {
+      const data = JSON.parse(body);
+      const user = data?.data?.user?.result;
+      if (user?.rest_id) {
+        return { id: user.rest_id, name: user.legacy?.name || screenName };
+      }
+    } catch {}
+  }
+
+  // Method 2: Try the v1.1 API endpoint
+  console.log(`  📡 Trying v1.1 API...`);
+  const v1Url = `https://api.twitter.com/1.1/users/show.json?screen_name=${screenName}`;
+  res = await fetch(v1Url, { headers, signal: AbortSignal.timeout(15000) });
+  body = await res.text();
+  console.log(`  📊 v1.1 HTTP ${res.status} | Body: ${body.length} bytes`);
+
+  if (res.ok && body.length > 0) {
+    try {
+      const data = JSON.parse(body);
+      if (data.id_str) {
+        return { id: data.id_str, name: data.name || screenName };
+      }
+    } catch {}
+  }
+
+  // Method 3: Try Twitter syndication/embed
+  console.log(`  📡 Trying syndication API...`);
+  const synUrl = `https://syndication.twitter.com/srv/timeline-profile/screen-name/${screenName}`;
+  res = await fetch(synUrl, {
+    headers: { ...headers, Accept: "text/html" },
     signal: AbortSignal.timeout(15000),
+    redirect: "follow",
   });
+  body = await res.text();
+  console.log(`  📊 Syndication HTTP ${res.status} | Body: ${body.length} bytes`);
 
-  const rawBody = await res.text();
-  console.log(`  📊 HTTP ${res.status} | Body length: ${rawBody.length}`);
-
-  if (!res.ok) {
-    console.log(`  🔍 Response (first 500):`, rawBody.slice(0, 500));
-    throw new Error(`UserByScreenName failed: HTTP ${res.status}`);
+  if (body.length > 100) {
+    // Extract tweet data from syndication HTML
+    const tweetMatches = [...body.matchAll(/data-tweet-id="(\d+)"/g)];
+    if (tweetMatches.length > 0) {
+      return { id: "syndication", name: screenName, syndication: true, html: body };
+    }
   }
 
-  let data;
-  try {
-    data = JSON.parse(rawBody);
-  } catch (e) {
-    console.log(`  🔍 JSON parse failed. Body (first 500):`, rawBody.slice(0, 500));
-    throw new Error(`UserByScreenName: invalid JSON response`);
-  }
-  const user = data?.data?.user?.result;
-  if (!user?.rest_id) {
-    throw new Error(`User @${screenName} not found`);
-  }
-
-  return {
-    id: user.rest_id,
-    name: user.legacy?.name || screenName,
-    description: user.legacy?.description || "",
-  };
+  throw new Error(`Could not find user @${screenName} via any method`);
 }
 
-// Step 2: Get user tweets
-async function getUserTweets(userId, cursor, headers) {
+// ─── Get user tweets ───
+async function getUserTweets(userId, headers) {
+  if (userId === "syndication") return null; // handled separately
+
   const variables = JSON.stringify({
     userId,
     count: 20,
@@ -138,7 +173,6 @@ async function getUserTweets(userId, cursor, headers) {
     withQuickPromoteEligibilityTweetFields: true,
     withVoice: true,
     withV2Timeline: true,
-    ...(cursor ? { cursor } : {}),
   });
   const features = JSON.stringify({
     rweb_tipjar_consumption_enabled: true,
@@ -166,55 +200,38 @@ async function getUserTweets(userId, cursor, headers) {
     responsive_web_enhance_cards_enabled: false,
   });
 
-  const url = `${GRAPHQL_BASE}/UserTweets?variables=${encodeURIComponent(variables)}&features=${encodeURIComponent(features)}`;
+  const url = `https://x.com/i/api/graphql/UserTweets?variables=${encodeURIComponent(variables)}&features=${encodeURIComponent(features)}`;
 
-  const res = await fetch(url, {
-    headers,
-    signal: AbortSignal.timeout(15000),
-  });
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+  const body = await res.text();
+  console.log(`  📊 UserTweets HTTP ${res.status} | Body: ${body.length} bytes`);
 
-  if (!res.ok) {
-    throw new Error(`UserTweets failed: HTTP ${res.status}`);
-  }
-
-  return await res.json();
+  if (!res.ok || body.length === 0) return null;
+  return JSON.parse(body);
 }
 
-// Parse tweet from X API response
-function parseTweet(tweetResult) {
-  const tweet = tweetResult?.tweet || tweetResult;
-  const legacy = tweet?.legacy;
+// Parse syndication HTML for tweets
+function parseSyndicationHtml(html, screenName) {
+  const tweets = [];
+  // Match tweet blocks in syndication HTML
+  const tweetBlocks = html.match(/<div[^>]*class="[^"]*timeline-Tweet[^"]*"[^>]*>[\s\S]*?<\/div>\s*<\/div>/g) || [];
 
-  if (!legacy || !legacy.full_text) return null;
-
-  // Skip retweets (we want original content)
-  if (legacy.retweeted_status_result) return null;
-
-  // Clean content: remove t.co media URLs
-  let text = legacy.full_text;
-  if (legacy.entities?.urls) {
-    for (const url of legacy.entities.urls) {
-      text = text.replace(url.url, url.expanded_url || "");
+  for (const block of tweetBlocks) {
+    const idMatch = block.match(/data-tweet-id="(\d+)"/);
+    const textMatch = block.match(/<p[^>]*class="[^"]*timeline-Tweet-text[^"]*"[^>]*>([\s\S]*?)<\/p>/);
+    if (idMatch && textMatch) {
+      let text = textMatch[1].replace(/<[^>]+>/g, "").trim();
+      text = text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+      if (text.length > 5) {
+        tweets.push({ tweetId: idMatch[1], text, author: screenName, authorName: screenName });
+      }
     }
   }
-  // Remove media URLs
-  if (legacy.entities?.media) {
-    for (const m of legacy.entities.media) {
-      text = text.replace(m.url, "");
-    }
-  }
-  text = text.replace(/\s+/g, " ").trim();
-
-  const tweetId = legacy.id_str || tweet.rest_id;
-  const author = legacy.user_results?.result?.legacy?.screen_name || "unknown";
-  const authorName = legacy.user_results?.result?.legacy?.name || author;
-  const createdAt = legacy.created_at;
-
-  return { tweetId, text, author, authorName, createdAt };
+  return tweets;
 }
 
-// Extract tweets from timeline response
-function extractTweets(apiResponse) {
+// Parse tweets from GraphQL response
+function parseTweets(apiResponse) {
   const tweets = [];
   const instructions =
     apiResponse?.data?.user?.result?.timeline_v2?.timeline?.instructions ||
@@ -223,202 +240,128 @@ function extractTweets(apiResponse) {
 
   for (const instruction of instructions) {
     if (instruction.type === "TimelineAddEntries" || instruction.type === "TimelineAddToModule") {
-      const entries = instruction.entries || instruction.moduleItems || [];
-      for (const entry of entries) {
-        // Handle cursor entries
-        if (entry.entryId?.startsWith("cursor-bottom")) continue;
-        if (entry.entryId?.startsWith("cursor-top")) continue;
-
-        // Handle tweet entries
+      for (const entry of instruction.entries || instruction.moduleItems || []) {
+        if (entry.entryId?.startsWith("cursor")) continue;
         const tweetResult =
           entry.content?.itemContent?.tweet_results?.result ||
           entry.content?.items?.[0]?.item?.itemContent?.tweet_results?.result;
-
         if (tweetResult) {
-          const parsed = parseTweet(tweetResult);
-          if (parsed) tweets.push(parsed);
+          const t = tweetResult?.tweet || tweetResult;
+          const legacy = t?.legacy;
+          if (!legacy?.full_text || legacy.retweeted_status_result) continue;
+          let text = legacy.full_text;
+          if (legacy.entities?.urls) for (const u of legacy.entities.urls) text = text.replace(u.url, u.expanded_url || "");
+          if (legacy.entities?.media) for (const m of legacy.entities.media) text = text.replace(m.url, "");
+          text = text.replace(/\s+/g, " ").trim();
+          const author = legacy.user_results?.result?.legacy?.screen_name || "unknown";
+          const authorName = legacy.user_results?.result?.legacy?.name || author;
+          tweets.push({ tweetId: legacy.id_str || t.rest_id, text, author, authorName });
         }
       }
     }
   }
-
   return tweets;
 }
 
-// Extract bottom cursor for pagination
-function extractCursor(apiResponse) {
-  const instructions =
-    apiResponse?.data?.user?.result?.timeline_v2?.timeline?.instructions ||
-    apiResponse?.data?.user?.result?.timeline?.timeline?.instructions ||
-    [];
-
-  for (const instruction of instructions) {
-    if (instruction.type === "TimelineAddEntries") {
-      for (const entry of instruction.entries || []) {
-        if (entry.entryId?.startsWith("cursor-bottom")) {
-          return entry.content?.value;
-        }
-      }
-    }
-  }
-  return null;
-}
-
-// ─── Supabase Operations ───
+// ─── Supabase ───
 async function insertPost(tweet) {
   const link = `https://x.com/${tweet.author}/status/${tweet.tweetId}`;
-
   const postData = {
     title: `[@${tweet.author}] ${tweet.text.slice(0, 50)}${tweet.text.length > 50 ? "..." : ""}`,
     content: `📢 @${tweet.author}\n\n${tweet.text}\n\n🔗 原文: ${link}`,
     author: `@${tweet.author}`,
     category: CONFIG.category || "X搬运",
-    likes: 0,
-    views: 0,
-    reposts: 0,
-    pinned: false,
-    edited: false,
+    likes: 0, views: 0, reposts: 0, pinned: false, edited: false,
   };
-
   const { data, error } = await supabase.from("posts").insert([postData]).select("*").single();
-
   if (error) {
-    if (error.code === "23505" || error.message?.includes("duplicate")) {
-      return null;
-    }
-    throw new Error(`Supabase error: ${error.message}`);
+    if (error.code === "23505") return null;
+    throw new Error(`Supabase: ${error.message}`);
   }
-
   return data;
 }
 
 // ─── Main ───
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function scrapeAccount(screenName, state, headers) {
-  console.log(`\n🐦 Scraping @${screenName}...`);
-
-  if (!state.accounts[screenName]) {
-    state.accounts[screenName] = { lastId: "0", totalImported: 0 };
-  }
+  console.log(`\n🐦 @${screenName}`);
+  if (!state.accounts[screenName]) state.accounts[screenName] = { lastId: "0", totalImported: 0 };
   const lastId = state.accounts[screenName].lastId || "0";
   console.log(`  📌 Last ID: ${lastId}`);
 
-  // Get user ID
   let userInfo;
   try {
     userInfo = await getUserId(screenName, headers);
-    console.log(`  👤 Found: ${userInfo.name} (ID: ${userInfo.id})`);
   } catch (e) {
-    console.log(`  ❌ Failed to get user: ${e.message}`);
+    console.log(`  ❌ ${e.message}`);
     return 0;
   }
+  console.log(`  👤 ${userInfo.name} (ID: ${userInfo.id})`);
 
-  // Get tweets
-  let apiResponse;
-  try {
-    apiResponse = await getUserTweets(userInfo.id, null, headers);
-  } catch (e) {
-    console.log(`  ❌ Failed to get tweets: ${e.message}`);
-    return 0;
+  let tweets;
+  if (userInfo.syndication) {
+    tweets = parseSyndicationHtml(userInfo.html, screenName);
+    console.log(`  📰 Syndication: ${tweets.length} tweets`);
+  } else {
+    const apiRes = await getUserTweets(userInfo.id, headers);
+    if (!apiRes) { console.log(`  ❌ Failed to get tweets`); return 0; }
+    tweets = parseTweets(apiRes);
+    console.log(`  📰 GraphQL: ${tweets.length} tweets`);
   }
 
-  const tweets = extractTweets(apiResponse);
-  console.log(`  📰 Found ${tweets.length} tweets`);
-
-  // Filter new tweets
   const newTweets = tweets.filter((t) => BigInt(t.tweetId) > BigInt(lastId));
-  console.log(`  🆕 ${newTweets.length} new tweets`);
-
+  console.log(`  🆕 ${newTweets.length} new`);
   if (newTweets.length === 0) return 0;
 
-  // Sort ascending by ID
   newTweets.sort((a, b) => (BigInt(a.tweetId) < BigInt(b.tweetId) ? -1 : 1));
-
-  // Limit batch
   const batch = newTweets.slice(0, CONFIG.batchSize || 15);
 
   let imported = 0;
   let maxId = lastId;
-
   for (const tweet of batch) {
     if (!tweet.text || tweet.text.length < 5) continue;
-
     try {
       const result = await insertPost(tweet);
-      if (result) {
-        imported++;
-        console.log(`  ✅ [${tweet.tweetId}] ${tweet.text.slice(0, 60)}...`);
-      }
+      if (result) { imported++; console.log(`  ✅ ${tweet.text.slice(0, 60)}...`); }
       if (BigInt(tweet.tweetId) > BigInt(maxId)) maxId = tweet.tweetId;
-    } catch (e) {
-      console.log(`  ❌ Error: ${e.message}`);
-    }
-
+    } catch (e) { console.log(`  ❌ ${e.message}`); }
     await sleep(500);
   }
 
-  state.accounts[screenName] = {
-    lastId: maxId,
-    lastRun: new Date().toISOString(),
-    totalImported: (state.accounts[screenName]?.totalImported || 0) + imported,
-  };
-
+  state.accounts[screenName] = { lastId: maxId, lastRun: new Date().toISOString(), totalImported: (state.accounts[screenName]?.totalImported || 0) + imported };
   return imported;
 }
 
 async function main() {
   console.log("═══════════════════════════════════════");
-  console.log("  STGBLOG X Scraper v2.0");
+  console.log("  STGBLOG X Scraper v3.0");
   console.log("═══════════════════════════════════════\n");
 
   const accounts = CONFIG.accounts || [];
-
-  if (accounts.length === 0) {
-    console.log("⚠️  No accounts configured.");
-    console.log('   Edit config.json: "accounts": ["username1", "username2"]');
-    process.exit(0);
-  }
-
-  if (!TWITTER_COOKIE) {
-    console.log("❌ TWITTER_COOKIE not set!");
-    console.log("   Set it as a GitHub Secret or environment variable.");
-    console.log("   Format: auth_token=xxx; ct0=yyy");
-    process.exit(1);
-  }
-
-  // Debug: show cookie format (masked)
-  const parts = TWITTER_COOKIE.split(";").map(s => s.trim());
-  console.log(`🔑 Cookie parts: ${parts.length}`);
-  for (const p of parts) {
-    const [k] = p.split("=");
-    console.log(`   ${k}: ${p.length > 20 ? p.slice(0, 10) + "..." + p.slice(-5) : p}`);
-  }
+  if (accounts.length === 0) { console.log("⚠️  No accounts. Edit config.json."); process.exit(0); }
+  if (!TWITTER_COOKIE) { console.log("❌ TWITTER_COOKIE not set!"); process.exit(1); }
 
   console.log(`📋 Accounts: ${accounts.map((a) => "@" + a).join(", ")}`);
-  const headers = buildHeaders(TWITTER_COOKIE);
+
+  // Try to get guest token as well
+  const guestToken = await getGuestToken();
+  if (guestToken) console.log(`🔑 Guest token: ${guestToken.slice(0, 10)}...`);
+
+  const headers = buildHeaders(TWITTER_COOKIE, guestToken);
   const state = loadState();
   let total = 0;
 
   for (const account of accounts) {
-    try {
-      total += await scrapeAccount(account, state, headers);
-    } catch (e) {
-      console.log(`\n❌ Fatal for @${account}: ${e.message}`);
-    }
+    try { total += await scrapeAccount(account, state, headers); }
+    catch (e) { console.log(`\n❌ ${e.message}`); }
     if (accounts.indexOf(account) < accounts.length - 1) await sleep(2000);
   }
 
   saveState(state);
-
   console.log("\n═══════════════════════════════════════");
   console.log(`  ✅ Done! Imported ${total} new post(s)`);
   console.log("═══════════════════════════════════════");
 }
 
-main().catch((e) => {
-  console.error("💥", e);
-  process.exit(1);
-});
+main().catch((e) => { console.error("💥", e); process.exit(1); });
