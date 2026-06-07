@@ -94,6 +94,10 @@ function extractTag(xml, tag) {
 
 function cleanContent(desc, title) {
   let text = desc;
+  // Decode HTML entities FIRST (so &lt;hr&gt; becomes <hr>)
+  text = text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(n));
   // Remove media embeds (video, img, hr dividers)
   text = text.replace(/<video[\s\S]*?<\/video>/gi, "");
   text = text.replace(/<img[^>]*>/gi, "");
@@ -103,10 +107,6 @@ function cleanContent(desc, title) {
   // Remove all remaining HTML tags
   text = text.replace(/<br\s*\/?>/gi, "\n");
   text = text.replace(/<[^>]+>/g, "");
-  // Decode HTML entities
-  text = text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
-    .replace(/&#\d+;/g, "");
   // Clean whitespace
   text = text.replace(/\n\s*\n/g, "\n").replace(/[ \t]+/g, " ").trim();
   if (text.length < 10 && title) text = title.replace(/^[^:]+:\s*/, "").trim();
