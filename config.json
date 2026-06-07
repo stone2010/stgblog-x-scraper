@@ -1,5 +1,16 @@
 {
-  "accounts": [],
+  "accounts": [
+    "morris",
+    "isgreatone",
+    "tombkeeper",
+    "fenbox",
+    "nakeciel",
+    "turingou",
+    "yitianshijie",
+    "naval",
+    "MorganHousel",
+    "theSamParr"
+  ],
   "category": "X搬运",
   "batchSize": 15,
   "minIntervalMinutes": 30
