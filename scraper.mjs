@@ -1,24 +1,22 @@
 #!/usr/bin/env node
 /**
- * STGBLOG X Scraper v4.0
+ * STGBLOG X Scraper v5.0
  *
- * 使用 yt-dlp 提取 X 帖子（最可靠的免费方案）
- * yt-dlp 有专门的 Twitter/X 提取器，能绕过大部分限制
+ * 使用自建 RSSHub 实例 + Supabase
+ * RSSHub 运行在 Docker 中，能可靠地抓取 X 内容
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
-import { execSync } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 
 const CONFIG = JSON.parse(readFileSync(new URL("./config.json", import.meta.url), "utf-8"));
 const STATE_FILE = new URL("./state.json", import.meta.url);
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://dbtdguasdbmlzpodfeht.supabase.co";
 const SUPABASE_KEY = process.env.SUPABASE_KEY || "sb_publishable_skyyIapm1MfIpT5R5NcleQ_-reVf604";
-const TWITTER_COOKIE = process.env.TWITTER_COOKIE || "";
+const RSSHUB_URL = process.env.RSSHUB_URL || "http://localhost:1200";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ─── State ───
 function loadState() {
   if (existsSync(STATE_FILE)) return JSON.parse(readFileSync(STATE_FILE, "utf-8"));
   return { accounts: {} };
@@ -27,97 +25,56 @@ function saveState(state) {
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// ─── Fetch user timeline via yt-dlp ───
-function fetchTimelineYtdlp(screenName) {
-  console.log(`  📡 yt-dlp: fetching @${screenName} timeline...`);
+// ─── RSS Fetching ───
+async function fetchRSS(screenName) {
+  const url = `${RSSHUB_URL}/twitter/user/${screenName}`;
+  console.log(`  📡 RSSHub: ${url}`);
 
-  // Write cookie file if available
-  let cookieArgs = "";
-  if (TWITTER_COOKIE) {
-    const cookieFile = "/tmp/x_cookies.txt";
-    // Convert "auth_token=xxx; ct0=yyy" to Netscape cookie format
-    const parts = TWITTER_COOKIE.split(";").map(s => s.trim());
-    let cookieContent = "# Netscape HTTP Cookie File\n";
-    for (const p of parts) {
-      const [name, ...vals] = p.split("=");
-      const value = vals.join("=");
-      cookieContent += `.x.com\tTRUE\t/\tTRUE\t2000000000\t${name.trim()}\t${value.trim()}\n`;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { Accept: "application/rss+xml, application/xml, text/xml" },
+        signal: AbortSignal.timeout(20000),
+      });
+
+      if (res.status === 429) {
+        console.log(`  ⏳ Rate limited, waiting ${(attempt + 1) * 5}s...`);
+        await new Promise((r) => setTimeout(r, (attempt + 1) * 5000));
+        continue;
+      }
+
+      if (!res.ok) {
+        console.log(`  ⚠️ HTTP ${res.status}`);
+        return null;
+      }
+
+      const xml = await res.text();
+      if (xml.includes("<item>")) return xml;
+      console.log(`  ⚠️ No items in RSS feed`);
+      return null;
+    } catch (e) {
+      console.log(`  ⚠️ ${e.message}`);
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 3000));
     }
-    writeFileSync(cookieFile, cookieContent);
-    cookieArgs = `--cookies "${cookieFile}"`;
   }
-
-  // Use yt-dlp to get the user's timeline JSON
-  // yt-dlp can extract tweet metadata without downloading media
-  const url = `https://x.com/${screenName}`;
-
-  try {
-    const cmd = [
-      "yt-dlp",
-      "--dump-json",
-      "--flat-playlist",
-      "--no-download",
-      "--no-warnings",
-      cookieArgs,
-      "--socket-timeout 15",
-      `"${url}"`,
-    ].filter(Boolean).join(" ");
-
-    const result = execSync(cmd, {
-      encoding: "utf-8",
-      timeout: 30000,
-      maxBuffer: 5 * 1024 * 1024,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    // Each line is a JSON object for one tweet
-    const tweets = [];
-    for (const line of result.split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const item = JSON.parse(line);
-        tweets.push({
-          tweetId: item.id || item.url?.match(/status\/(\d+)/)?.[1] || "",
-          text: item.description || item.title || "",
-          author: screenName,
-          authorName: item.uploader || item.channel || screenName,
-          timestamp: item.timestamp || 0,
-        });
-      } catch {}
-    }
-    return tweets;
-  } catch (e) {
-    console.log(`  ⚠️ yt-dlp error: ${e.message?.slice(0, 200)}`);
-    return null;
-  }
+  return null;
 }
 
-// ─── Alternative: fetch via RSS with cookie ───
-function fetchTimelineRss(screenName) {
-  console.log(`  📡 RSS fallback for @${screenName}...`);
-  try {
-    // Use rsshub.app with cookie forwarding (it may work)
-    const cmd = `curl -sL --max-time 15 -H "User-Agent: Mozilla/5.0" "https://rsshub.app/twitter/user/${screenName}" 2>&1`;
-    const result = execSync(cmd, { encoding: "utf-8", timeout: 20000 });
-    if (result.includes("<item>")) {
-      const items = [];
-      const re = /<item>([\s\S]*?)<\/item>/g;
-      let m;
-      while ((m = re.exec(result)) !== null) {
-        const block = m[1];
-        const title = extractTag(block, "title");
-        const link = extractTag(block, "link");
-        const desc = extractTag(block, "description");
-        const tweetId = link.match(/status\/(\d+)/)?.[1];
-        if (tweetId) {
-          const text = desc.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/\s+/g, " ").trim();
-          items.push({ tweetId, text, author: screenName, authorName: screenName });
-        }
-      }
-      return items;
-    }
-  } catch {}
-  return null;
+// ─── RSS Parsing ───
+function parseRSSItems(xml) {
+  const items = [];
+  const re = /<item>([\s\S]*?)<\/item>/g;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const block = m[1];
+    items.push({
+      title: extractTag(block, "title"),
+      link: extractTag(block, "link"),
+      description: extractTag(block, "description"),
+      pubDate: extractTag(block, "pubDate"),
+    });
+  }
+  return items;
 }
 
 function extractTag(xml, tag) {
@@ -129,13 +86,30 @@ function extractTag(xml, tag) {
   return m ? m[1].trim() : "";
 }
 
+function cleanContent(desc, title) {
+  let text = desc.replace(/<img[^>]*>/gi, "").replace(/<a[^>]*>.*?<\/a>/gi, "").replace(/<[^>]+>/g, "");
+  text = text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ");
+  text = text.replace(/\s+/g, " ").trim();
+  if (text.length < 10 && title) text = title.replace(/^[^:]+:\s*/, "").trim();
+  return text;
+}
+
+function extractTweetId(link) {
+  const m = link.match(/status\/(\d+)/);
+  return m ? m[1] : null;
+}
+
+function extractAuthor(link) {
+  const m = link.match(/(?:x\.com|twitter\.com)\/([^/]+)\/status/);
+  return m ? m[1] : null;
+}
+
 // ─── Supabase ───
-async function insertPost(tweet) {
-  const link = `https://x.com/${tweet.author}/status/${tweet.tweetId}`;
+async function insertPost(author, tweetId, content, link) {
   const postData = {
-    title: `[@${tweet.author}] ${tweet.text.slice(0, 50)}${tweet.text.length > 50 ? "..." : ""}`,
-    content: `📢 @${tweet.author}\n\n${tweet.text}\n\n🔗 原文: ${link}`,
-    author: `@${tweet.author}`,
+    title: `[@${author}] ${content.slice(0, 50)}${content.length > 50 ? "..." : ""}`,
+    content: `📢 @${author}\n\n${content}\n\n🔗 原文: ${link}`,
+    author: `@${author}`,
     category: CONFIG.category || "X搬运",
     likes: 0, views: 0, reposts: 0, pinned: false, edited: false,
   };
@@ -156,33 +130,41 @@ async function scrapeAccount(screenName, state) {
   const lastId = state.accounts[screenName].lastId || "0";
   console.log(`  📌 Last ID: ${lastId}`);
 
-  // Try yt-dlp first, then RSS
-  let tweets = fetchTimelineYtdlp(screenName);
-  if (!tweets || tweets.length === 0) {
-    tweets = fetchTimelineRss(screenName);
-  }
-  if (!tweets || tweets.length === 0) {
-    console.log(`  ❌ No tweets found for @${screenName}`);
-    return 0;
-  }
+  const xml = await fetchRSS(screenName);
+  if (!xml) { console.log(`  ❌ Failed to fetch RSS`); return 0; }
 
-  console.log(`  📰 Found ${tweets.length} tweets`);
+  const items = parseRSSItems(xml);
+  console.log(`  📰 ${items.length} items`);
 
-  const newTweets = tweets.filter((t) => t.tweetId && BigInt(t.tweetId) > BigInt(lastId));
-  console.log(`  🆕 ${newTweets.length} new`);
-  if (newTweets.length === 0) return 0;
+  const newItems = items.filter((item) => {
+    const tid = extractTweetId(item.link);
+    return tid && BigInt(tid) > BigInt(lastId);
+  });
+  console.log(`  🆕 ${newItems.length} new`);
+  if (newItems.length === 0) return 0;
 
-  newTweets.sort((a, b) => (BigInt(a.tweetId) < BigInt(b.tweetId) ? -1 : 1));
-  const batch = newTweets.slice(0, CONFIG.batchSize || 15);
+  newItems.sort((a, b) => {
+    const idA = BigInt(extractTweetId(a.link));
+    const idB = BigInt(extractTweetId(b.link));
+    return idA < idB ? -1 : 1;
+  });
 
+  const batch = newItems.slice(0, CONFIG.batchSize || 15);
   let imported = 0;
   let maxId = lastId;
-  for (const tweet of batch) {
-    if (!tweet.text || tweet.text.length < 5) continue;
+
+  for (const item of batch) {
+    const tweetId = extractTweetId(item.link);
+    const content = cleanContent(item.description, item.title);
+    if (!content || content.length < 5) continue;
+
+    const author = extractAuthor(item.link) || screenName;
+    const link = `https://x.com/${author}/status/${tweetId}`;
+
     try {
-      const result = await insertPost(tweet);
-      if (result) { imported++; console.log(`  ✅ ${tweet.text.slice(0, 60)}...`); }
-      if (BigInt(tweet.tweetId) > BigInt(maxId)) maxId = tweet.tweetId;
+      const result = await insertPost(author, tweetId, content, link);
+      if (result) { imported++; console.log(`  ✅ ${content.slice(0, 60)}...`); }
+      if (BigInt(tweetId) > BigInt(maxId)) maxId = tweetId;
     } catch (e) { console.log(`  ❌ ${e.message}`); }
     await sleep(500);
   }
@@ -196,29 +178,22 @@ async function scrapeAccount(screenName, state) {
 
 async function main() {
   console.log("═══════════════════════════════════════");
-  console.log("  STGBLOG X Scraper v4.0");
+  console.log("  STGBLOG X Scraper v5.0 (RSSHub)");
   console.log("═══════════════════════════════════════\n");
 
   const accounts = CONFIG.accounts || [];
   if (accounts.length === 0) { console.log("⚠️  No accounts."); process.exit(0); }
 
-  // Check yt-dlp availability
-  try {
-    const ver = execSync("yt-dlp --version", { encoding: "utf-8" }).trim();
-    console.log(`🔧 yt-dlp v${ver}`);
-  } catch {
-    console.log("❌ yt-dlp not found! Install it first.");
-    process.exit(1);
-  }
-
   console.log(`📋 Accounts: ${accounts.map((a) => "@" + a).join(", ")}`);
+  console.log(`📡 RSSHub: ${RSSHUB_URL}`);
+
   const state = loadState();
   let total = 0;
 
   for (const account of accounts) {
     try { total += await scrapeAccount(account, state); }
     catch (e) { console.log(`\n❌ ${e.message}`); }
-    if (accounts.indexOf(account) < accounts.length - 1) await sleep(2000);
+    if (accounts.indexOf(account) < accounts.length - 1) await sleep(3000);
   }
 
   saveState(state);

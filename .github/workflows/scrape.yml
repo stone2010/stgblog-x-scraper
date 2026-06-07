@@ -11,7 +11,7 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -22,23 +22,35 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install yt-dlp
-        run: |
-          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-          sudo chmod a+rx /usr/local/bin/yt-dlp
-          yt-dlp --version
-
       - name: Install dependencies
         run: npm install @supabase/supabase-js
+
+      - name: Start RSSHub
+        run: |
+          docker pull diygod/rsshub:latest
+          docker run -d --name rsshub \
+            -p 1200:1200 \
+            -e TWITTER_AUTH_TOKEN="${{ secrets.TWITTER_AUTH_TOKEN }}" \
+            -e TWITTER_CT0="${{ secrets.TWITTER_CT0 }}" \
+            diygod/rsshub:latest
+          echo "Waiting for RSSHub to start..."
+          sleep 15
+          curl -s http://localhost:1200/healthz || echo "RSSHub health check failed"
 
       - name: Run scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TWITTER_COOKIE: ${{ secrets.TWITTER_COOKIE }}
+          RSSHUB_URL: "http://localhost:1200"
         run: node scraper.mjs
 
+      - name: Stop RSSHub
+        if: always()
+        run: docker stop rsshub || true
+
       - name: Commit state
+        if: success()
         run: |
           git config user.name "x-scraper-bot"
           git config user.email "scraper@stgblog.com"
