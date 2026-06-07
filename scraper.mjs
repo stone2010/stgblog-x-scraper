@@ -1,25 +1,22 @@
 #!/usr/bin/env node
 /**
- * STGBLOG X (Twitter) Content Scraper v3.0
+ * STGBLOG X Scraper v4.0
  *
- * 使用 X 内部 API + Cookie + Guest Token
+ * 使用 yt-dlp 提取 X 帖子（最可靠的免费方案）
+ * yt-dlp 有专门的 Twitter/X 提取器，能绕过大部分限制
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
+import { execSync } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 
 const CONFIG = JSON.parse(readFileSync(new URL("./config.json", import.meta.url), "utf-8"));
 const STATE_FILE = new URL("./state.json", import.meta.url);
-
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://dbtdguasdbmlzpodfeht.supabase.co";
-const SUPABASE_KEY =
-  process.env.SUPABASE_KEY ||
-  "sb_publishable_skyyIapm1MfIpT5R5NcleQ_-reVf604";
+const SUPABASE_KEY = process.env.SUPABASE_KEY || "sb_publishable_skyyIapm1MfIpT5R5NcleQ_-reVf604";
 const TWITTER_COOKIE = process.env.TWITTER_COOKIE || "";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-const BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 
 // ─── State ───
 function loadState() {
@@ -30,237 +27,106 @@ function saveState(state) {
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// ─── Cookie parsing ───
-function parseCookies(str) {
-  const c = {};
-  for (const p of str.split(";")) {
-    const [k, ...v] = p.trim().split("=");
-    if (k && v.length) c[k.trim()] = v.join("=").trim();
+// ─── Fetch user timeline via yt-dlp ───
+function fetchTimelineYtdlp(screenName) {
+  console.log(`  📡 yt-dlp: fetching @${screenName} timeline...`);
+
+  // Write cookie file if available
+  let cookieArgs = "";
+  if (TWITTER_COOKIE) {
+    const cookieFile = "/tmp/x_cookies.txt";
+    // Convert "auth_token=xxx; ct0=yyy" to Netscape cookie format
+    const parts = TWITTER_COOKIE.split(";").map(s => s.trim());
+    let cookieContent = "# Netscape HTTP Cookie File\n";
+    for (const p of parts) {
+      const [name, ...vals] = p.split("=");
+      const value = vals.join("=");
+      cookieContent += `.x.com\tTRUE\t/\tTRUE\t2000000000\t${name.trim()}\t${value.trim()}\n`;
+    }
+    writeFileSync(cookieFile, cookieContent);
+    cookieArgs = `--cookies "${cookieFile}"`;
   }
-  return c;
+
+  // Use yt-dlp to get the user's timeline JSON
+  // yt-dlp can extract tweet metadata without downloading media
+  const url = `https://x.com/${screenName}`;
+
+  try {
+    const cmd = [
+      "yt-dlp",
+      "--dump-json",
+      "--flat-playlist",
+      "--no-download",
+      "--no-warnings",
+      cookieArgs,
+      "--socket-timeout 15",
+      `"${url}"`,
+    ].filter(Boolean).join(" ");
+
+    const result = execSync(cmd, {
+      encoding: "utf-8",
+      timeout: 30000,
+      maxBuffer: 5 * 1024 * 1024,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    // Each line is a JSON object for one tweet
+    const tweets = [];
+    for (const line of result.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const item = JSON.parse(line);
+        tweets.push({
+          tweetId: item.id || item.url?.match(/status\/(\d+)/)?.[1] || "",
+          text: item.description || item.title || "",
+          author: screenName,
+          authorName: item.uploader || item.channel || screenName,
+          timestamp: item.timestamp || 0,
+        });
+      } catch {}
+    }
+    return tweets;
+  } catch (e) {
+    console.log(`  ⚠️ yt-dlp error: ${e.message?.slice(0, 200)}`);
+    return null;
+  }
 }
 
-// ─── Get Guest Token (fallback) ───
-async function getGuestToken() {
+// ─── Alternative: fetch via RSS with cookie ───
+function fetchTimelineRss(screenName) {
+  console.log(`  📡 RSS fallback for @${screenName}...`);
   try {
-    const res = await fetch("https://api.twitter.com/1.1/guest/activate.json", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${BEARER_TOKEN}`,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      return data.guest_token;
+    // Use rsshub.app with cookie forwarding (it may work)
+    const cmd = `curl -sL --max-time 15 -H "User-Agent: Mozilla/5.0" "https://rsshub.app/twitter/user/${screenName}" 2>&1`;
+    const result = execSync(cmd, { encoding: "utf-8", timeout: 20000 });
+    if (result.includes("<item>")) {
+      const items = [];
+      const re = /<item>([\s\S]*?)<\/item>/g;
+      let m;
+      while ((m = re.exec(result)) !== null) {
+        const block = m[1];
+        const title = extractTag(block, "title");
+        const link = extractTag(block, "link");
+        const desc = extractTag(block, "description");
+        const tweetId = link.match(/status\/(\d+)/)?.[1];
+        if (tweetId) {
+          const text = desc.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/\s+/g, " ").trim();
+          items.push({ tweetId, text, author: screenName, authorName: screenName });
+        }
+      }
+      return items;
     }
-  } catch (e) {
-    console.log(`  ⚠️ Guest token failed: ${e.message}`);
-  }
+  } catch {}
   return null;
 }
 
-// ─── Build request headers ───
-function buildHeaders(cookieStr, guestToken) {
-  const cookies = parseCookies(cookieStr);
-  const h = {
-    Authorization: `Bearer ${BEARER_TOKEN}`,
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    Accept: "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    Referer: "https://x.com/",
-    "Content-Type": "application/json",
-  };
-
-  if (cookieStr) {
-    h.Cookie = cookieStr;
-    if (cookies.ct0) h["x-csrf-token"] = cookies.ct0;
-    h["x-twitter-auth-type"] = "OAuth2Session";
-    h["x-twitter-active-user"] = "yes";
-    h["x-twitter-client-language"] = "en";
-  }
-
-  if (guestToken) {
-    h["x-guest-token"] = guestToken;
-  }
-
-  return h;
-}
-
-// ─── Try to get user ID via multiple methods ───
-async function getUserId(screenName, headers) {
-  // Method 1: GraphQL API
-  const variables = JSON.stringify({ screen_name: screenName, withSafetyModeUserFields: true });
-  const features = JSON.stringify({
-    hidden_profile_subscriptions_enabled: true,
-    rweb_tipjar_consumption_enabled: true,
-    responsive_web_graphql_exclude_directive_enabled: true,
-    verified_phone_label_enabled: false,
-    subscriptions_verification_info_is_identity_verified_enabled: true,
-    subscriptions_verification_info_verified_since_enabled: true,
-    highlights_tweets_tab_ui_enabled: true,
-    responsive_web_twitter_article_notes_tab_enabled: true,
-    subscriptions_feature_can_gift_premium: true,
-    creator_subscriptions_tweet_preview_api_enabled: true,
-    responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
-    responsive_web_graphql_timeline_navigation_enabled: true,
-  });
-
-  const url = `https://x.com/i/api/graphql/UserByScreenName?variables=${encodeURIComponent(variables)}&features=${encodeURIComponent(features)}`;
-
-  console.log(`  📡 GraphQL: UserByScreenName @${screenName}`);
-  let res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
-  let body = await res.text();
-  console.log(`  📊 HTTP ${res.status} | Body: ${body.length} bytes`);
-
-  if (body.length > 0) {
-    try {
-      const data = JSON.parse(body);
-      const user = data?.data?.user?.result;
-      if (user?.rest_id) {
-        return { id: user.rest_id, name: user.legacy?.name || screenName };
-      }
-    } catch {}
-  }
-
-  // Method 2: Try the v1.1 API endpoint
-  console.log(`  📡 Trying v1.1 API...`);
-  const v1Url = `https://api.twitter.com/1.1/users/show.json?screen_name=${screenName}`;
-  res = await fetch(v1Url, { headers, signal: AbortSignal.timeout(15000) });
-  body = await res.text();
-  console.log(`  📊 v1.1 HTTP ${res.status} | Body: ${body.length} bytes`);
-
-  if (res.ok && body.length > 0) {
-    try {
-      const data = JSON.parse(body);
-      if (data.id_str) {
-        return { id: data.id_str, name: data.name || screenName };
-      }
-    } catch {}
-  }
-
-  // Method 3: Try Twitter syndication/embed
-  console.log(`  📡 Trying syndication API...`);
-  const synUrl = `https://syndication.twitter.com/srv/timeline-profile/screen-name/${screenName}`;
-  res = await fetch(synUrl, {
-    headers: { ...headers, Accept: "text/html" },
-    signal: AbortSignal.timeout(15000),
-    redirect: "follow",
-  });
-  body = await res.text();
-  console.log(`  📊 Syndication HTTP ${res.status} | Body: ${body.length} bytes`);
-
-  if (body.length > 100) {
-    // Extract tweet data from syndication HTML
-    const tweetMatches = [...body.matchAll(/data-tweet-id="(\d+)"/g)];
-    if (tweetMatches.length > 0) {
-      return { id: "syndication", name: screenName, syndication: true, html: body };
-    }
-  }
-
-  throw new Error(`Could not find user @${screenName} via any method`);
-}
-
-// ─── Get user tweets ───
-async function getUserTweets(userId, headers) {
-  if (userId === "syndication") return null; // handled separately
-
-  const variables = JSON.stringify({
-    userId,
-    count: 20,
-    includePromotedContent: false,
-    withQuickPromoteEligibilityTweetFields: true,
-    withVoice: true,
-    withV2Timeline: true,
-  });
-  const features = JSON.stringify({
-    rweb_tipjar_consumption_enabled: true,
-    responsive_web_graphql_exclude_directive_enabled: true,
-    verified_phone_label_enabled: false,
-    creator_subscriptions_tweet_preview_api_enabled: true,
-    responsive_web_graphql_timeline_navigation_enabled: true,
-    responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
-    communities_web_enable_tweet_community_results_fetch: true,
-    c9s_tweet_anatomy_moderator_badge_enabled: true,
-    articles_preview_enabled: true,
-    responsive_web_edit_tweet_api_enabled: true,
-    graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
-    view_counts_everywhere_api_enabled: true,
-    longform_notetweets_consumption_enabled: true,
-    responsive_web_twitter_article_tweet_consumption_enabled: true,
-    tweet_awards_web_tipping_enabled: false,
-    creator_subscriptions_quote_tweet_preview_enabled: false,
-    freedom_of_speech_not_reach_fetch_enabled: true,
-    standardized_nudges_misinfo: true,
-    tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
-    rweb_video_timestamps_enabled: true,
-    longform_notetweets_rich_text_read_enabled: true,
-    longform_notetweets_inline_media_enabled: true,
-    responsive_web_enhance_cards_enabled: false,
-  });
-
-  const url = `https://x.com/i/api/graphql/UserTweets?variables=${encodeURIComponent(variables)}&features=${encodeURIComponent(features)}`;
-
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
-  const body = await res.text();
-  console.log(`  📊 UserTweets HTTP ${res.status} | Body: ${body.length} bytes`);
-
-  if (!res.ok || body.length === 0) return null;
-  return JSON.parse(body);
-}
-
-// Parse syndication HTML for tweets
-function parseSyndicationHtml(html, screenName) {
-  const tweets = [];
-  // Match tweet blocks in syndication HTML
-  const tweetBlocks = html.match(/<div[^>]*class="[^"]*timeline-Tweet[^"]*"[^>]*>[\s\S]*?<\/div>\s*<\/div>/g) || [];
-
-  for (const block of tweetBlocks) {
-    const idMatch = block.match(/data-tweet-id="(\d+)"/);
-    const textMatch = block.match(/<p[^>]*class="[^"]*timeline-Tweet-text[^"]*"[^>]*>([\s\S]*?)<\/p>/);
-    if (idMatch && textMatch) {
-      let text = textMatch[1].replace(/<[^>]+>/g, "").trim();
-      text = text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-      if (text.length > 5) {
-        tweets.push({ tweetId: idMatch[1], text, author: screenName, authorName: screenName });
-      }
-    }
-  }
-  return tweets;
-}
-
-// Parse tweets from GraphQL response
-function parseTweets(apiResponse) {
-  const tweets = [];
-  const instructions =
-    apiResponse?.data?.user?.result?.timeline_v2?.timeline?.instructions ||
-    apiResponse?.data?.user?.result?.timeline?.timeline?.instructions ||
-    [];
-
-  for (const instruction of instructions) {
-    if (instruction.type === "TimelineAddEntries" || instruction.type === "TimelineAddToModule") {
-      for (const entry of instruction.entries || instruction.moduleItems || []) {
-        if (entry.entryId?.startsWith("cursor")) continue;
-        const tweetResult =
-          entry.content?.itemContent?.tweet_results?.result ||
-          entry.content?.items?.[0]?.item?.itemContent?.tweet_results?.result;
-        if (tweetResult) {
-          const t = tweetResult?.tweet || tweetResult;
-          const legacy = t?.legacy;
-          if (!legacy?.full_text || legacy.retweeted_status_result) continue;
-          let text = legacy.full_text;
-          if (legacy.entities?.urls) for (const u of legacy.entities.urls) text = text.replace(u.url, u.expanded_url || "");
-          if (legacy.entities?.media) for (const m of legacy.entities.media) text = text.replace(m.url, "");
-          text = text.replace(/\s+/g, " ").trim();
-          const author = legacy.user_results?.result?.legacy?.screen_name || "unknown";
-          const authorName = legacy.user_results?.result?.legacy?.name || author;
-          tweets.push({ tweetId: legacy.id_str || t.rest_id, text, author, authorName });
-        }
-      }
-    }
-  }
-  return tweets;
+function extractTag(xml, tag) {
+  const cdataRe = new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>`, "i");
+  const cm = xml.match(cdataRe);
+  if (cm) return cm[1].trim();
+  const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
+  const m = xml.match(re);
+  return m ? m[1].trim() : "";
 }
 
 // ─── Supabase ───
@@ -284,33 +150,25 @@ async function insertPost(tweet) {
 // ─── Main ───
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function scrapeAccount(screenName, state, headers) {
+async function scrapeAccount(screenName, state) {
   console.log(`\n🐦 @${screenName}`);
   if (!state.accounts[screenName]) state.accounts[screenName] = { lastId: "0", totalImported: 0 };
   const lastId = state.accounts[screenName].lastId || "0";
   console.log(`  📌 Last ID: ${lastId}`);
 
-  let userInfo;
-  try {
-    userInfo = await getUserId(screenName, headers);
-  } catch (e) {
-    console.log(`  ❌ ${e.message}`);
+  // Try yt-dlp first, then RSS
+  let tweets = fetchTimelineYtdlp(screenName);
+  if (!tweets || tweets.length === 0) {
+    tweets = fetchTimelineRss(screenName);
+  }
+  if (!tweets || tweets.length === 0) {
+    console.log(`  ❌ No tweets found for @${screenName}`);
     return 0;
   }
-  console.log(`  👤 ${userInfo.name} (ID: ${userInfo.id})`);
 
-  let tweets;
-  if (userInfo.syndication) {
-    tweets = parseSyndicationHtml(userInfo.html, screenName);
-    console.log(`  📰 Syndication: ${tweets.length} tweets`);
-  } else {
-    const apiRes = await getUserTweets(userInfo.id, headers);
-    if (!apiRes) { console.log(`  ❌ Failed to get tweets`); return 0; }
-    tweets = parseTweets(apiRes);
-    console.log(`  📰 GraphQL: ${tweets.length} tweets`);
-  }
+  console.log(`  📰 Found ${tweets.length} tweets`);
 
-  const newTweets = tweets.filter((t) => BigInt(t.tweetId) > BigInt(lastId));
+  const newTweets = tweets.filter((t) => t.tweetId && BigInt(t.tweetId) > BigInt(lastId));
   console.log(`  🆕 ${newTweets.length} new`);
   if (newTweets.length === 0) return 0;
 
@@ -329,31 +187,36 @@ async function scrapeAccount(screenName, state, headers) {
     await sleep(500);
   }
 
-  state.accounts[screenName] = { lastId: maxId, lastRun: new Date().toISOString(), totalImported: (state.accounts[screenName]?.totalImported || 0) + imported };
+  state.accounts[screenName] = {
+    lastId: maxId, lastRun: new Date().toISOString(),
+    totalImported: (state.accounts[screenName]?.totalImported || 0) + imported,
+  };
   return imported;
 }
 
 async function main() {
   console.log("═══════════════════════════════════════");
-  console.log("  STGBLOG X Scraper v3.0");
+  console.log("  STGBLOG X Scraper v4.0");
   console.log("═══════════════════════════════════════\n");
 
   const accounts = CONFIG.accounts || [];
-  if (accounts.length === 0) { console.log("⚠️  No accounts. Edit config.json."); process.exit(0); }
-  if (!TWITTER_COOKIE) { console.log("❌ TWITTER_COOKIE not set!"); process.exit(1); }
+  if (accounts.length === 0) { console.log("⚠️  No accounts."); process.exit(0); }
+
+  // Check yt-dlp availability
+  try {
+    const ver = execSync("yt-dlp --version", { encoding: "utf-8" }).trim();
+    console.log(`🔧 yt-dlp v${ver}`);
+  } catch {
+    console.log("❌ yt-dlp not found! Install it first.");
+    process.exit(1);
+  }
 
   console.log(`📋 Accounts: ${accounts.map((a) => "@" + a).join(", ")}`);
-
-  // Try to get guest token as well
-  const guestToken = await getGuestToken();
-  if (guestToken) console.log(`🔑 Guest token: ${guestToken.slice(0, 10)}...`);
-
-  const headers = buildHeaders(TWITTER_COOKIE, guestToken);
   const state = loadState();
   let total = 0;
 
   for (const account of accounts) {
-    try { total += await scrapeAccount(account, state, headers); }
+    try { total += await scrapeAccount(account, state); }
     catch (e) { console.log(`\n❌ ${e.message}`); }
     if (accounts.indexOf(account) < accounts.length - 1) await sleep(2000);
   }

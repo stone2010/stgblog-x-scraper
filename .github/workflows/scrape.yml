@@ -2,7 +2,6 @@ name: X Content Scraper
 
 on:
   schedule:
-    # 每30分钟运行一次
     - cron: "*/30 * * * *"
   workflow_dispatch:
 
@@ -22,6 +21,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+
+      - name: Install yt-dlp
+        run: |
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          yt-dlp --version
 
       - name: Install dependencies
         run: npm install @supabase/supabase-js
