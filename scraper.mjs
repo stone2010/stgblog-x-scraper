@@ -30,16 +30,22 @@ async function fetchRSS(screenName) {
   const url = `${RSSHUB_URL}/twitter/user/${screenName}`;
   console.log(`  📡 RSSHub: ${url}`);
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const res = await fetch(url, {
         headers: { Accept: "application/rss+xml, application/xml, text/xml" },
-        signal: AbortSignal.timeout(20000),
+        signal: AbortSignal.timeout(25000),
       });
 
       if (res.status === 429) {
         console.log(`  ⏳ Rate limited, waiting ${(attempt + 1) * 5}s...`);
         await new Promise((r) => setTimeout(r, (attempt + 1) * 5000));
+        continue;
+      }
+
+      if (res.status === 503) {
+        console.log(`  ⚠️ 503, retrying in ${(attempt + 1) * 3}s...`);
+        await new Promise((r) => setTimeout(r, (attempt + 1) * 3000));
         continue;
       }
 
@@ -54,7 +60,7 @@ async function fetchRSS(screenName) {
       return null;
     } catch (e) {
       console.log(`  ⚠️ ${e.message}`);
-      if (attempt < 2) await new Promise((r) => setTimeout(r, 3000));
+      if (attempt < 4) await new Promise((r) => setTimeout(r, 3000));
     }
   }
   return null;
@@ -87,9 +93,22 @@ function extractTag(xml, tag) {
 }
 
 function cleanContent(desc, title) {
-  let text = desc.replace(/<img[^>]*>/gi, "").replace(/<a[^>]*>.*?<\/a>/gi, "").replace(/<[^>]+>/g, "");
-  text = text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ");
-  text = text.replace(/\s+/g, " ").trim();
+  let text = desc;
+  // Remove media embeds (video, img, hr dividers)
+  text = text.replace(/<video[\s\S]*?<\/video>/gi, "");
+  text = text.replace(/<img[^>]*>/gi, "");
+  text = text.replace(/<hr[^>]*>/gi, "");
+  // Remove links but keep link text
+  text = text.replace(/<a[^>]*>([\s\S]*?)<\/a>/gi, "$1");
+  // Remove all remaining HTML tags
+  text = text.replace(/<br\s*\/?>/gi, "\n");
+  text = text.replace(/<[^>]+>/g, "");
+  // Decode HTML entities
+  text = text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
+    .replace(/&#\d+;/g, "");
+  // Clean whitespace
+  text = text.replace(/\n\s*\n/g, "\n").replace(/[ \t]+/g, " ").trim();
   if (text.length < 10 && title) text = title.replace(/^[^:]+:\s*/, "").trim();
   return text;
 }
