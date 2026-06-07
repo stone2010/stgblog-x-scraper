@@ -1,19 +1,19 @@
 {
   "accounts": {
     "tombkeeper": {
-      "lastId": "1347860799973371905",
-      "lastRun": "2026-06-07T04:31:55.140Z",
-      "totalImported": 15
+      "lastId": "2028978411927200170",
+      "lastRun": "2026-06-07T08:08:00.721Z",
+      "totalImported": 19
     },
     "fenbox": {
-      "lastId": "2032593906349830229",
-      "lastRun": "2026-06-07T04:32:09.964Z",
-      "totalImported": 15
+      "lastId": "2056923738885750942",
+      "lastRun": "2026-06-07T08:08:07.041Z",
+      "totalImported": 18
     },
     "turingou": {
-      "lastId": "2063245590922952868",
-      "lastRun": "2026-06-07T04:32:24.941Z",
-      "totalImported": 15
+      "lastId": "2063393520879370428",
+      "lastRun": "2026-06-07T08:08:12.904Z",
+      "totalImported": 18
     },
     "naval": {
       "lastId": "2063303568262840622",
@@ -21,9 +21,9 @@
       "totalImported": 14
     },
     "MorganHousel": {
-      "lastId": "2055647185019318766",
-      "lastRun": "2026-06-07T04:32:53.778Z",
-      "totalImported": 15
+      "lastId": "2062860277536661857",
+      "lastRun": "2026-06-07T08:08:23.081Z",
+      "totalImported": 18
     },
     "theSamParr": {
       "lastId": "2063076856857817593",
@@ -31,9 +31,9 @@
       "totalImported": 11
     },
     "nntaleb": {
-      "lastId": "2063286092283933164",
-      "lastRun": "2026-06-07T04:33:21.337Z",
-      "totalImported": 15
+      "lastId": "2063317621735322047",
+      "lastRun": "2026-06-07T08:08:31.329Z",
+      "totalImported": 16
     },
     "ESYudkowsky": {
       "lastId": "2062980293901025693",
@@ -41,9 +41,9 @@
       "totalImported": 12
     },
     "waitbutwhy": {
-      "lastId": "2058977799310848169",
-      "lastRun": "2026-06-07T04:33:49.477Z",
-      "totalImported": 15
+      "lastId": "2063336102828646805",
+      "lastRun": "2026-06-07T08:08:42.406Z",
+      "totalImported": 19
     },
     "yitianshijie": {
       "lastId": "2040464903115243799",
