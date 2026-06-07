@@ -96,16 +96,27 @@ async function getUserId(screenName, headers) {
 
   const url = `${GRAPHQL_BASE}/UserByScreenName?variables=${encodeURIComponent(variables)}&features=${encodeURIComponent(features)}`;
 
+  console.log(`  📡 Requesting UserByScreenName for @${screenName}...`);
   const res = await fetch(url, {
     headers,
     signal: AbortSignal.timeout(15000),
   });
 
+  const rawBody = await res.text();
+  console.log(`  📊 HTTP ${res.status} | Body length: ${rawBody.length}`);
+
   if (!res.ok) {
+    console.log(`  🔍 Response (first 500):`, rawBody.slice(0, 500));
     throw new Error(`UserByScreenName failed: HTTP ${res.status}`);
   }
 
-  const data = await res.json();
+  let data;
+  try {
+    data = JSON.parse(rawBody);
+  } catch (e) {
+    console.log(`  🔍 JSON parse failed. Body (first 500):`, rawBody.slice(0, 500));
+    throw new Error(`UserByScreenName: invalid JSON response`);
+  }
   const user = data?.data?.user?.result;
   if (!user?.rest_id) {
     throw new Error(`User @${screenName} not found`);
@@ -376,6 +387,14 @@ async function main() {
     console.log("   Set it as a GitHub Secret or environment variable.");
     console.log("   Format: auth_token=xxx; ct0=yyy");
     process.exit(1);
+  }
+
+  // Debug: show cookie format (masked)
+  const parts = TWITTER_COOKIE.split(";").map(s => s.trim());
+  console.log(`🔑 Cookie parts: ${parts.length}`);
+  for (const p of parts) {
+    const [k] = p.split("=");
+    console.log(`   ${k}: ${p.length > 20 ? p.slice(0, 10) + "..." + p.slice(-5) : p}`);
   }
 
   console.log(`📋 Accounts: ${accounts.map((a) => "@" + a).join(", ")}`);
