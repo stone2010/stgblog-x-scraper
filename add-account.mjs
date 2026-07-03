@@ -12,6 +12,8 @@ import { readFileSync, writeFileSync } from "fs";
 
 const configPath = new URL("./config.json", import.meta.url);
 const config = JSON.parse(readFileSync(configPath, "utf-8"));
+node add-account.mjs add <Morris>
+node add-account.mjs add <LanLan>
 
 const [action, username] = process.argv.slice(2);
 
