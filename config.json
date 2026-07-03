@@ -1,15 +1,6 @@
 {
   "accounts": [
-    "tombkeeper",
-    "fenbox",
-    "turingou",
-    "naval",
-    "MorganHousel",
-    "theSamParr",
-    "nntaleb",
-    "ESYudkowsky",
-    "waitbutwhy",
-    "yitianshijie"
+    "Morris",
   ],
   "category": "X搬运",
   "batchSize": 15,
